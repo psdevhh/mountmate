@@ -3,6 +3,7 @@
 import Combine
 import DiskArbitration
 import Foundation
+import IOKit
 
 class DiskMounter: ObservableObject {
   @Published var blockUSBAutoMount: Bool = UserDefaults.standard.bool(forKey: "blockUSBAutoMount")
@@ -21,9 +22,23 @@ class DiskMounter: ObservableObject {
   /// the session is restarted.
   private var hasPerformedStartupMaintenance = false
 
+  /// IOKit media-arrival notifications: unlike DiskArbitration's
+  /// disk-appeared events, these fire for locked encrypted volumes too.
+  private var ioNotificationPort: IONotificationPortRef?
+  private var ioMediaIterator: io_iterator_t = 0
+  private let sweepLock = NSLock()
+  private var isSweepingLockedVolumes = false
+  private var isSweepPending = false
+
   init() {
     NotificationCenter.default.addObserver(
       self, selector: #selector(handleWillMount), name: .willManuallyMount, object: nil)
+
+    // Saving the first remembered volume password enables appearance-based
+    // auto-unlock, which needs the DiskArbitration session to be running.
+    NotificationCenter.default.addObserver(
+      self, selector: #selector(handleSavedPassword), name: .didSaveVolumePassword,
+      object: nil)
 
     PersistenceManager.shared.$blockedVolumes
       .receive(on: DispatchQueue.main)
@@ -38,8 +53,15 @@ class DiskMounter: ObservableObject {
     stopDiskArbitration()
   }
 
+  @objc private func handleSavedPassword(_ notification: Notification) {
+    updateSessionState()
+  }
+
   private func updateSessionState() {
-    let shouldBeActive = blockUSBAutoMount || !PersistenceManager.shared.blockedVolumes.isEmpty
+    let shouldBeActive =
+      blockUSBAutoMount
+      || !PersistenceManager.shared.blockedVolumes.isEmpty
+      || KeychainManager.shared.hasAnyRememberedPasswords()
     if shouldBeActive && session == nil {
       startDiskArbitration()
     } else if !shouldBeActive && session != nil {
@@ -184,9 +206,133 @@ class DiskMounter: ObservableObject {
 
     let matching: [String: Any] = [kDADiskDescriptionVolumeMountableKey as String: kCFBooleanTrue!]
     DARegisterDiskMountApprovalCallback(session, matching as CFDictionary, mountCallback, context)
+
     DASessionSetDispatchQueue(session, DispatchQueue.main)
 
+    startMediaNotifications()
     scheduleStartupMaintenance()
+  }
+
+  /// Watches for media arrivals via IOKit. DiskArbitration's disk-appeared
+  /// events never fire for locked encrypted volumes — the exact volumes
+  /// appearance-based auto-unlock is for — so the notification has to come
+  /// from the IOKit level, where every IOMedia publish (a plugged disk, an
+  /// attached image) is visible.
+  private func startMediaNotifications() {
+    guard ioNotificationPort == nil else { return }
+    guard let port = IONotificationPortCreate(kIOMainPortDefault) else { return }
+    ioNotificationPort = port
+    // Dispatch-queue delivery: unlike a runloop source it does not depend on
+    // the main runloop running in a particular mode.
+    IONotificationPortSetDispatchQueue(port, DispatchQueue.main)
+
+    let refcon = Unmanaged.passUnretained(self).toOpaque()
+    let callback: IOServiceMatchingCallback = { refcon, iterator in
+      guard let refcon else { return }
+      let this = Unmanaged<DiskMounter>.fromOpaque(refcon).takeUnretainedValue()
+      // Drain the iterator so the notification re-arms for future arrivals.
+      while IOIteratorNext(iterator) != 0 {}
+      this.scheduleLockedVolumeSweep()
+    }
+
+    let matching = IOServiceMatching("IOMedia")
+    let addResult = IOServiceAddMatchingNotification(
+      port, kIOFirstPublishNotification, matching, callback, refcon, &ioMediaIterator)
+
+    // The iterator arrives pre-armed with all already-present media; drain
+    // it so only future arrivals notify, then sweep once for the current
+    // state (covers a drive plugged in before the app launched).
+    var initialCount = 0
+    while IOIteratorNext(ioMediaIterator) != 0 { initialCount += 1 }
+    scheduleLockedVolumeSweep()
+  }
+
+  private func stopMediaNotifications() {
+    guard let port = ioNotificationPort else { return }
+    IONotificationPortSetDispatchQueue(port, nil)
+    IONotificationPortDestroy(port)
+    ioNotificationPort = nil
+  }
+
+  /// Coalesces bursts of media arrivals (a disk publishes several IOMedia
+  /// objects) into a single sweep shortly after the bus settles.
+  private func scheduleLockedVolumeSweep() {
+    DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.4) { [weak self] in
+      self?.sweepLockedVolumes()
+    }
+  }
+
+  /// Unlocks every encrypted volume that is present, locked, and has a
+  /// remembered password — without mounting it. Mounting stays a deliberate
+  /// act (user click or the OS automount, subject to the blockers).
+  ///
+  /// Unlocking immediately also outruns macOS's attach-time unlock agent:
+  /// on macOS versions where that agent cannot silently read the keychain
+  /// entry (entries recreated or touched by third-party apps lose the
+  /// agent's access grant), it would otherwise put a password dialog on
+  /// screen at every plug-in. Once the volume is unlocked, the agent has
+  /// nothing to ask about.
+  private func sweepLockedVolumes() {
+    sweepLock.lock()
+    if isSweepingLockedVolumes {
+      // A sweep is in flight; remember to run again afterwards so bursts of
+      // media arrivals are never dropped.
+      isSweepPending = true
+      sweepLock.unlock()
+      return
+    }
+    isSweepingLockedVolumes = true
+    isSweepPending = false
+    sweepLock.unlock()
+    defer {
+      sweepLock.lock()
+      let rerun = isSweepPending
+      isSweepPending = false
+      isSweepingLockedVolumes = false
+      sweepLock.unlock()
+      if rerun {
+        scheduleLockedVolumeSweep()
+      }
+    }
+
+    let list = runProcess(
+      executable: "/usr/sbin/diskutil", arguments: ["list", "-plist"], timeout: 30)
+    guard let data = list.stdout.data(using: .utf8),
+      let plist = try? PropertyListSerialization.propertyList(
+        from: data, options: [], format: nil) as? [String: Any],
+      let disks = plist["AllDisksAndPartitions"] as? [[String: Any]]
+    else {
+      return
+    }
+
+    for disk in disks {
+      let volumes =
+        (disk["APFSVolumes"] as? [[String: Any]] ?? []) + (disk["Partitions"] as? [[String: Any]]
+          ?? [])
+      for volume in volumes {
+        guard let volumeUUID = volume["VolumeUUID"] as? String,
+          let passphrase = DriveManager.savedPassphrase(volumeUUID: volumeUUID)
+        else { continue }
+
+        // An unlock attempt on a volume that is not locked (or not
+        // encrypted) fails harmlessly; -nomount keeps mounting a deliberate
+        // act regardless.
+        let unlock = runProcess(
+          executable: "/usr/sbin/diskutil",
+          arguments: ["apfs", "unlockVolume", volumeUUID, "-stdinpassphrase", "-nomount"],
+          input: Data(passphrase.utf8))
+        if unlock.succeeded {
+          print("🔓 Auto-unlocked encrypted volume \(volumeUUID) on appearance.")
+          NotificationCenter.default.post(
+            name: .didAutoUnlockVolume, object: nil, userInfo: ["volumeUUID": volumeUUID])
+          DispatchQueue.main.async {
+            DriveManager.shared.refreshDrives(qos: .utility)
+          }
+        }
+        // Failures stay silent: the volume may not be locked after all, and
+        // stale passwords are surfaced properly by user-initiated mounts.
+      }
+    }
   }
 
   /// Runs once per app launch, shortly after the Disk Arbitration session
@@ -261,6 +407,7 @@ class DiskMounter: ObservableObject {
   private func stopDiskArbitration() {
     guard let session = session else { return }
     DASessionSetDispatchQueue(session, nil)
+    stopMediaNotifications()
     manualMountApprovalLock.lock()
     manualMountApprovals.removeAll()
     manualMountApprovalLock.unlock()

@@ -92,6 +92,18 @@ final class EncryptedVolumeKeychainTests: XCTestCase {
       DriveManager.isVolumeNotLockedErrorMessage(
         "Error unlocking APFS Volume: The pass phrase does not match"))
   }
+
+  func testAlreadyUnmountedDetection() {
+    XCTAssertTrue(
+      DriveManager.isAlreadyUnmountedMessage("disk7s1 was already unmounted"))
+    XCTAssertTrue(DriveManager.isAlreadyUnmountedMessage("volume is not mounted"))
+    XCTAssertFalse(DriveManager.isAlreadyUnmountedMessage("resource busy"))
+  }
+
+  func testHasAnyRememberedPasswordsReflectsSavedEntries() {
+    _ = keychain.save(password: "x", for: volumeUUID)
+    XCTAssertTrue(keychain.hasAnyRememberedPasswords())
+  }
 }
 
 extension DriveManager.SavedPassphraseSource: Equatable {}

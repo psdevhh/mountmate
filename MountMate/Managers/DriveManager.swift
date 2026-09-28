@@ -387,6 +387,13 @@ class DriveManager: ObservableObject {
     return nil
   }
 
+  /// UUID-based variant of `savedPassphrase(for:)` for DiskArbitration
+  /// callbacks, which only have the volume UUID.
+  static func savedPassphrase(volumeUUID: String) -> String? {
+    KeychainManager.shared.load(account: volumeUUID)
+      ?? KeychainManager.shared.loadEncryptedVolumePassword(volumeUUID: volumeUUID)
+  }
+
   /// Tries to unlock a locked encrypted volume with a password already saved
   /// in the keychain (see `savedPassphrase(for:)`) so the user is not asked
   /// again. The password prompt only appears when no saved password exists —
@@ -414,6 +421,9 @@ class DriveManager: ObservableObject {
     let handler = { (passphrase: String, saveInKeychain: Bool) in
       if saveInKeychain {
         _ = KeychainManager.shared.save(password: passphrase, for: volume.id)
+        // Enables appearance-based auto-unlock if this was the first
+        // remembered password.
+        NotificationCenter.default.post(name: .didSaveVolumePassword, object: nil)
       }
       self.mountLockedVolume(volume, passphrase: passphrase)
     }
@@ -444,6 +454,7 @@ class DriveManager: ObservableObject {
         // entry so future lookups never have to read — and prompt for access
         // to — the system entry again.
         _ = KeychainManager.shared.save(password: passphrase, for: volume.id)
+        NotificationCenter.default.post(name: .didSaveVolumePassword, object: nil)
       }
       if !result.succeeded {
         if Self.isVolumeNotLockedErrorMessage(result.stderr) {
@@ -505,7 +516,10 @@ class DriveManager: ObservableObject {
         executable: "/usr/sbin/diskutil",
         arguments: ["unmount", volume.deviceIdentifier])
       DispatchQueue.main.async {
-        if !result.succeeded {
+        // A concurrent unmount (e.g. the OS reacting to the volume going
+        // away) can win the race; the end state is what the user asked for.
+        let benign = Self.isAlreadyUnmountedMessage("\(result.stdout)\(result.stderr)")
+        if !result.succeeded, !benign {
           let errMsg =
             result.timedOut
             ? "The operation timed out after 15 seconds."
@@ -518,6 +532,12 @@ class DriveManager: ObservableObject {
         self.refreshDrives(qos: .userInitiated)
       }
     }
+  }
+
+  /// diskutil's wording when there was nothing left to unmount.
+  static func isAlreadyUnmountedMessage(_ output: String) -> Bool {
+    let lower = output.lowercased()
+    return lower.contains("already unmounted") || lower.contains("not mounted")
   }
 
   func remount(volume: Volume) {

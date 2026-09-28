@@ -49,6 +49,18 @@ class KeychainManager {
     SecItemDelete(query as CFDictionary)
   }
 
+  /// Whether MountMate holds any remembered passwords under its own service
+  /// (encrypted volumes and network shares alike). Used to decide whether
+  /// the DiskArbitration session needs to run.
+  func hasAnyRememberedPasswords() -> Bool {
+    let query: [String: Any] = [
+      kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: serviceName,
+    ]
+    var result: AnyObject?
+    return SecItemCopyMatching(query as CFDictionary, &result) != errSecItemNotFound
+  }
+
   // MARK: - Encrypted volume passwords (system keychain format)
 
   /// macOS saves passwords for encrypted volumes as generic-password items
