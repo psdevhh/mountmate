@@ -369,14 +369,20 @@ class DriveManager: ObservableObject {
     case mountMate
   }
 
-  /// Returns a previously saved password for an encrypted volume, preferring
-  /// the system keychain entry so MountMate and macOS stay in sync.
+  /// Returns a previously saved password for an encrypted volume.
+  ///
+  /// MountMate's own entry is preferred: reading it never triggers a
+  /// keychain access prompt, unlike the system entry, whose access grants
+  /// are per item and reset whenever macOS recreates it. The system entry is
+  /// only consulted as a fallback; after a successful use its password is
+  /// imported into MountMate's private entry (see `performUnlock`), so the
+  /// system entry is read at most once per password.
   static func savedPassphrase(for volume: Volume) -> (passphrase: String, source: SavedPassphraseSource)? {
-    if let password = KeychainManager.shared.loadEncryptedVolumePassword(volumeUUID: volume.id) {
-      return (password, .system)
-    }
     if let password = KeychainManager.shared.load(account: volume.id) {
       return (password, .mountMate)
+    }
+    if let password = KeychainManager.shared.loadEncryptedVolumePassword(volumeUUID: volume.id) {
+      return (password, .system)
     }
     return nil
   }
@@ -433,6 +439,12 @@ class DriveManager: ObservableObject {
       arguments: ["apfs", "unlockVolume", volume.id, "-stdinpassphrase"],
       input: Data(passphrase.utf8))
     DispatchQueue.main.async {
+      if result.succeeded, savedSource == .system {
+        // The system entry's password works. Import it into MountMate's own
+        // entry so future lookups never have to read — and prompt for access
+        // to — the system entry again.
+        _ = KeychainManager.shared.save(password: passphrase, for: volume.id)
+      }
       if !result.succeeded {
         if Self.isVolumeNotLockedErrorMessage(result.stderr) {
           // The volume is already unlocked — e.g. an earlier attempt unlocked

@@ -88,6 +88,13 @@ final class LockedVolumeUnlockIntegrationTests: XCTestCase {
     // The prompt must never have been presented: it is driven by
     // userActionError, which must stay nil for the whole recovery.
     XCTAssertNil(DriveManager.shared.userActionError)
+
+    // The system entry's password must have been imported into MountMate's
+    // private entry, so future lookups never read the system entry again.
+    XCTAssertEqual(
+      KeychainManager.shared.load(account: volumeUUID), passphrase,
+      "system password was not imported into MountMate's private entry")
+    XCTAssertEqual(DriveManager.savedPassphrase(for: volume)?.source, .mountMate)
   }
 
   /// `diskutil info -plist` reports mounting via the "Mounted" boolean on

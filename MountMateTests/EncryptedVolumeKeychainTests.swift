@@ -56,17 +56,20 @@ final class EncryptedVolumeKeychainTests: XCTestCase {
     XCTAssertNil(keychain.loadEncryptedVolumePassword(volumeUUID: volumeUUID))
   }
 
-  func testSavedPassphrasePrefersSystemEntryOverLegacyEntry() {
+  func testSavedPassphrasePrefersPrivateEntryOverSystemEntry() {
     let volume = makeVolume(id: volumeUUID)
     XCTAssertNil(DriveManager.savedPassphrase(for: volume))
 
-    _ = keychain.save(password: "legacy pw", for: volumeUUID)
-    XCTAssertEqual(DriveManager.savedPassphrase(for: volume)?.passphrase, "legacy pw")
-    XCTAssertEqual(DriveManager.savedPassphrase(for: volume)?.source, .mountMate)
-
+    // System entry alone is used as fallback.
     XCTAssertEqual(createSystemEntry(password: "system pw"), errSecSuccess)
     XCTAssertEqual(DriveManager.savedPassphrase(for: volume)?.passphrase, "system pw")
     XCTAssertEqual(DriveManager.savedPassphrase(for: volume)?.source, .system)
+
+    // The private entry wins: reading it never triggers a keychain access
+    // prompt.
+    _ = keychain.save(password: "private pw", for: volumeUUID)
+    XCTAssertEqual(DriveManager.savedPassphrase(for: volume)?.passphrase, "private pw")
+    XCTAssertEqual(DriveManager.savedPassphrase(for: volume)?.source, .mountMate)
   }
 
   func testLockedVolumeErrorDetection() {
