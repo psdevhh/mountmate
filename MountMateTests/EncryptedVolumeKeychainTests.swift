@@ -36,48 +36,16 @@ final class EncryptedVolumeKeychainTests: XCTestCase {
     return SecItemAdd(attributes as CFDictionary, nil)
   }
 
-  private func systemEntryCount() -> Int {
-    let query: [String: Any] = [
-      kSecClass as String: kSecClassGenericPassword,
-      kSecAttrService as String: volumeUUID,
-      kSecAttrAccount as String: volumeUUID,
-      kSecMatchLimit as String: kSecMatchLimitAll,
-      kSecReturnAttributes as String: true,
-    ]
-    var result: AnyObject?
-    let status = SecItemCopyMatching(query as CFDictionary, &result)
-    guard status == errSecSuccess else { return 0 }
-    return (result as? [[String: Any]])?.count ?? 0
-  }
+  func testRememberedPasswordSavesPrivateEntryAndNeverTouchesSystemEntry() {
+    // MountMate's "remember password" writes only its private entry; the
+    // system entry (if any) must stay untouched — writing it invalidates the
+    // access list macOS's attach-time auto-unlock depends on.
+    XCTAssertEqual(createSystemEntry(password: "system pw"), errSecSuccess)
 
-  func testRememberedPasswordSavesPrivateEntryWhenNoSystemEntryExists() {
-    let outcome = keychain.saveRememberedEncryptedVolumePassword(
-      "secret", volumeUUID: volumeUUID)
-    XCTAssertEqual(outcome, .privateEntrySaved)
-    XCTAssertNil(keychain.loadEncryptedVolumePassword(volumeUUID: volumeUUID))
-    XCTAssertEqual(keychain.load(account: volumeUUID), "secret")
-  }
+    _ = keychain.save(password: "private pw", for: volumeUUID)
 
-  func testRememberedPasswordUpdatesExistingSystemEntryInPlace() {
-    XCTAssertEqual(createSystemEntry(password: "old"), errSecSuccess)
-
-    let outcome = keychain.saveRememberedEncryptedVolumePassword(
-      "new", volumeUUID: volumeUUID)
-    XCTAssertEqual(outcome, .systemEntryUpdated)
-    XCTAssertEqual(keychain.loadEncryptedVolumePassword(volumeUUID: volumeUUID), "new")
-    // In place: still exactly one system item, and no private duplicate.
-    XCTAssertEqual(systemEntryCount(), 1)
-    XCTAssertNil(keychain.load(account: volumeUUID))
-  }
-
-  func testRememberedPasswordReplacesStalePrivateEntry() {
-    _ = keychain.save(password: "old private", for: volumeUUID)
-    XCTAssertEqual(createSystemEntry(password: "system"), errSecSuccess)
-
-    _ = keychain.saveRememberedEncryptedVolumePassword("new", volumeUUID: volumeUUID)
-    XCTAssertEqual(keychain.loadEncryptedVolumePassword(volumeUUID: volumeUUID), "new")
-    XCTAssertNil(keychain.load(account: volumeUUID))
-    XCTAssertEqual(systemEntryCount(), 1)
+    XCTAssertEqual(keychain.loadEncryptedVolumePassword(volumeUUID: volumeUUID), "system pw")
+    XCTAssertEqual(keychain.load(account: volumeUUID), "private pw")
   }
 
   func testEncryptedVolumePasswordLoadDeleteRoundTrip() {
@@ -123,5 +91,4 @@ final class EncryptedVolumeKeychainTests: XCTestCase {
   }
 }
 
-extension KeychainManager.RememberedPasswordSave: Equatable {}
 extension DriveManager.SavedPassphraseSource: Equatable {}

@@ -399,16 +399,15 @@ class DriveManager: ObservableObject {
     }
   }
 
-  /// Shows the password prompt for a locked encrypted volume. When the user
-  /// opts in, the password is saved via
-  /// `KeychainManager.saveRememberedEncryptedVolumePassword(_:volumeUUID:)`,
-  /// which updates the system "Encrypted Volume Password" entry in place so
-  /// macOS's attach-time auto-unlock keeps working.
+  /// Shows the password prompt for a locked encrypted volume. "Remember
+  /// password" writes MountMate's own private keychain entry — the system
+  /// "Encrypted Volume Password" entry is never written to, so macOS's
+  /// attach-time auto-unlock keeps sole ownership of it (see
+  /// KeychainManager).
   private func presentLockedVolumeAlert(for volume: Volume) {
     let handler = { (passphrase: String, saveInKeychain: Bool) in
       if saveInKeychain {
-        _ = KeychainManager.shared.saveRememberedEncryptedVolumePassword(
-          passphrase, volumeUUID: volume.id)
+        _ = KeychainManager.shared.save(password: passphrase, for: volume.id)
       }
       self.mountLockedVolume(volume, passphrase: passphrase)
     }
