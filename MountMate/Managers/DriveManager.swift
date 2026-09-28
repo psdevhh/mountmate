@@ -288,7 +288,11 @@ class DriveManager: ObservableObject {
       let result = runProcess(
         executable: "/usr/sbin/diskutil", arguments: ["mount", volume.deviceIdentifier])
 
-      if !result.timedOut, !result.stderr.isEmpty,
+      // A locked encrypted volume is not the race condition the retry below
+      // exists for; it is handled immediately by the keychain recovery in
+      // handleDiskUtilError.
+      if !Self.isLockedVolumeErrorMessage(result.stderr), !result.timedOut,
+        !result.stderr.isEmpty,
         result.stderr.lowercased().contains("failed to mount")
       {
         print(
@@ -316,14 +320,15 @@ class DriveManager: ObservableObject {
   ) {
     DispatchQueue.main.async {
       if !result.succeeded {
-        if allowsErrorAlerts {
-          let errMsg =
-            result.timedOut
-            ? "The operation timed out after 15 seconds."
-            : (result.stderr.isEmpty
-              ? "diskutil exited with code \(result.exitCode ?? -1)." : result.stderr)
-          self.handleDiskUtilError(errMsg, for: volume.name, volume: volume, operation: .mount)
-        }
+        let errMsg =
+          result.timedOut
+          ? "The operation timed out after 15 seconds."
+          : (result.stderr.isEmpty
+            ? "diskutil exited with code \(result.exitCode ?? -1)." : result.stderr)
+        // handleDiskUtilError honors allowsErrorAlerts: silent mount paths
+        // still get keychain-based unlocking of encrypted volumes, but never
+        // surface dialogs.
+        self.handleDiskUtilError(errMsg, for: volume.name, volume: volume, operation: .mount, allowsErrorAlerts: allowsErrorAlerts)
         self.busyVolumeIdentifier = nil
       }
       self.refreshDrives(qos: .userInitiated)
@@ -336,33 +341,100 @@ class DriveManager: ObservableObject {
     NotificationCenter.default.post(name: .willManuallyMount, object: nil, userInfo: userInfo)
     DispatchQueue.main.async { self.busyVolumeIdentifier = volume.id }
 
-    // Check if we have a saved password
-    if let savedPassword = KeychainManager.shared.load(account: volume.id) {
-      self.performUnlock(volume: volume, passphrase: savedPassword)
-      return
-    }
-
     DispatchQueue.global(qos: .userInitiated).async {
       self.performUnlock(volume: volume, passphrase: passphrase)
     }
   }
 
-  private func performUnlock(volume: Volume, passphrase: String) {
+  /// Where a saved encrypted-volume password was found.
+  enum SavedPassphraseSource {
+    /// The system "Encrypted Volume Password" keychain entry, shared with
+    /// macOS's own unlock dialog and attach-time auto-unlock.
+    case system
+    /// The private MountMate keychain entry written by versions <= 5.19.
+    case mountMate
+  }
+
+  /// Returns a previously saved password for an encrypted volume, preferring
+  /// the system keychain entry so MountMate and macOS stay in sync.
+  static func savedPassphrase(for volume: Volume) -> (passphrase: String, source: SavedPassphraseSource)? {
+    if let password = KeychainManager.shared.loadEncryptedVolumePassword(volumeUUID: volume.id) {
+      return (password, .system)
+    }
+    if let password = KeychainManager.shared.load(account: volume.id) {
+      return (password, .mountMate)
+    }
+    return nil
+  }
+
+  /// Tries to unlock a locked encrypted volume with a password already saved
+  /// in the keychain (see `savedPassphrase(for:)`) so the user is not asked
+  /// again. The password prompt only appears when no saved password exists —
+  /// or a saved one fails; automatic (non-user-initiated) mounts stay silent.
+  private func recoverLockedVolume(_ volume: Volume, allowsErrorAlerts: Bool) {
+    DispatchQueue.global(qos: .userInitiated).async {
+      if let saved = Self.savedPassphrase(for: volume) {
+        self.performUnlock(
+          volume: volume, passphrase: saved.passphrase, savedSource: saved.source,
+          allowsErrorAlerts: allowsErrorAlerts)
+      } else if allowsErrorAlerts {
+        DispatchQueue.main.async { self.presentLockedVolumeAlert(for: volume) }
+      }
+    }
+  }
+
+  /// Shows the password prompt for a locked encrypted volume. When the user
+  /// opts in, the password is saved as the system "Encrypted Volume Password"
+  /// keychain entry, so macOS's attach-time auto-unlock can use it too.
+  private func presentLockedVolumeAlert(for volume: Volume) {
+    let handler = { (passphrase: String, saveInKeychain: Bool) in
+      if saveInKeychain {
+        _ = KeychainManager.shared.saveEncryptedVolumePassword(
+          passphrase, volumeUUID: volume.id, volumeName: volume.name)
+        // Replace the private entry older versions may have written so there
+        // is a single source of truth.
+        KeychainManager.shared.delete(account: volume.id)
+      }
+      self.mountLockedVolume(volume, passphrase: passphrase)
+    }
+    self.userActionError = AppAlert(
+      title: String(
+        format: NSLocalizedString("“%@” is locked", comment: "Alert title"), volume.name),
+      message: String(
+        format: NSLocalizedString(
+          "Enter the password to unlock “%@”", comment: "Alert message"),
+        volume.name),
+      kind: .lockedVolume(LockedVolumeAppAlert(onConfirm: handler)))
+  }
+
+  private func performUnlock(
+    volume: Volume, passphrase: String, savedSource: SavedPassphraseSource? = nil,
+    allowsErrorAlerts: Bool = true
+  ) {
     let result = runProcess(
       executable: "/usr/sbin/diskutil",
       arguments: ["apfs", "unlockVolume", volume.id, "-stdinpassphrase"],
       input: Data(passphrase.utf8))
     DispatchQueue.main.async {
       if !result.succeeded {
-        // If saved password failed, maybe delete it?
-        // But for now let's just show error.
-        let errMsg =
-          result.timedOut
-          ? "The operation timed out after 15 seconds."
-          : (result.stderr.isEmpty
-            ? "diskutil exited with code \(result.exitCode ?? -1)." : result.stderr)
-        self.handleDiskUtilError(
-          errMsg, for: volume.name, volume: volume, operation: .mount)
+        if let source = savedSource {
+          // A saved password no longer works. Drop MountMate's own stale
+          // entry (the system entry is left for macOS's unlock dialog to
+          // reconcile) and re-prompt for the current one.
+          if source == .mountMate {
+            KeychainManager.shared.delete(account: volume.id)
+          }
+          if allowsErrorAlerts {
+            self.presentLockedVolumeAlert(for: volume)
+          }
+        } else if allowsErrorAlerts {
+          let errMsg =
+            result.timedOut
+            ? "The operation timed out after 15 seconds."
+            : (result.stderr.isEmpty
+              ? "diskutil exited with code \(result.exitCode ?? -1)." : result.stderr)
+          self.handleDiskUtilError(errMsg, for: volume.name, volume: volume, operation: .mount)
+        }
         self.busyVolumeIdentifier = nil
       }
       self.refreshDrives(qos: .userInitiated)
@@ -804,7 +876,7 @@ class DriveManager: ObservableObject {
 
   private func handleDiskUtilError(
     _ error: String, for name: String, volume: Volume? = nil, disk: PhysicalDisk? = nil,
-    operation: DiskOperation
+    operation: DiskOperation, allowsErrorAlerts: Bool = true
   ) {
     let parsedError = self.parseDiskUtilError(error, for: name, operation: operation)
     let title: String
@@ -813,21 +885,23 @@ class DriveManager: ObservableObject {
 
     switch parsedError {
     case .mountLockedVolume:
-      title = String(
-        format: NSLocalizedString("“%@” is locked", comment: "Alert title"), name)
-      message = String(
-        format: NSLocalizedString(
-          "Enter the password to unlock “%@”", comment: "Alert message"),
-        name)
-      let handler = { (passphrase: String, saveInKeychain: Bool) in
-        guard let volume = volume else { return }
-        if saveInKeychain {
-          _ = KeychainManager.shared.save(password: passphrase, for: volume.id)
-        }
-        self.mountLockedVolume(volume, passphrase: passphrase)
+      if let volume {
+        // Try saved keychain passwords (the system "Encrypted Volume
+        // Password" entry first, then MountMate's legacy entry) before — or,
+        // for automatic mounts, instead of — asking the user. The prompt only
+        // appears if no saved password unlocks the volume.
+        recoverLockedVolume(volume, allowsErrorAlerts: allowsErrorAlerts)
+        return
       }
-      let lockedVolumeAlert = LockedVolumeAppAlert(onConfirm: handler)
-      kind = .lockedVolume(lockedVolumeAlert)
+      // Without a volume model there is nothing to unlock programmatically.
+      title = NSLocalizedString("Mount Failed", comment: "Alert title")
+      message =
+        String(
+          format: NSLocalizedString(
+            "An unknown error occurred while trying to mount “%@”.", comment: "Error message"),
+          name) + "\n\n"
+        + NSLocalizedString("Details", comment: "Error details prefix") + ":\n\(error)"
+      kind = .basic
     case .mountEFIVolume:
       title = NSLocalizedString("Mount Failed", comment: "Alert title")
       message = NSLocalizedString(
@@ -903,7 +977,11 @@ class DriveManager: ObservableObject {
         + NSLocalizedString("Details", comment: "Error details prefix") + ":\n\(error)"
       kind = .basic
     }
-    self.userActionError = AppAlert(title: title, message: message, kind: kind)
+    // Automatic (non-user-initiated) mount attempts must never surface
+    // dialogs; their failures are handled silently above.
+    if allowsErrorAlerts {
+      self.userActionError = AppAlert(title: title, message: message, kind: kind)
+    }
   }
 
   private func parseDiskUtilError(_ rawError: String, for name: String, operation: DiskOperation)
@@ -942,13 +1020,18 @@ class DriveManager: ObservableObject {
       }
     }
 
-    if rawError.contains(
-      "This is an encrypted and locked APFS Volume; use \"diskutil apfs unlockVolume\"")
-    {
+    if Self.isLockedVolumeErrorMessage(rawError) {
       return .mountLockedVolume
     }
 
     return .other
+  }
+
+  /// diskutil's exact wording when `mount` is pointed at a locked, encrypted
+  /// APFS volume.
+  static func isLockedVolumeErrorMessage(_ rawError: String) -> Bool {
+    rawError.contains(
+      "This is an encrypted and locked APFS Volume; use \"diskutil apfs unlockVolume\"")
   }
 
   private func getFileSystemAttributes(for path: String) throws -> (free: Int64, total: Int64) {
