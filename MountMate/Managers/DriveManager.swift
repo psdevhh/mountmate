@@ -279,8 +279,7 @@ class DriveManager: ObservableObject {
     volume: Volume, allowsErrorAlerts: Bool = true, isUserInitiated: Bool = true
   ) {
     if isUserInitiated {
-      let userInfo = ["deviceIdentifier": volume.deviceIdentifier]
-      NotificationCenter.default.post(name: .willManuallyMount, object: nil, userInfo: userInfo)
+      grantManualMountApproval(for: volume.deviceIdentifier)
     }
     KeepAliveManager.shared.resume(volume: volume)
     DispatchQueue.main.async { self.busyVolumeIdentifier = volume.id }
@@ -301,22 +300,25 @@ class DriveManager: ObservableObject {
 
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 15) {
           if isUserInitiated {
-            let userInfo = ["deviceIdentifier": volume.deviceIdentifier]
-            NotificationCenter.default.post(
-              name: .willManuallyMount, object: nil, userInfo: userInfo)
+            self.grantManualMountApproval(for: volume.deviceIdentifier)
           }
           let retryResult = runProcess(
             executable: "/usr/sbin/diskutil", arguments: ["mount", volume.deviceIdentifier])
-          self.handleMountResult(retryResult, for: volume, allowsErrorAlerts: allowsErrorAlerts)
+          self.handleMountResult(
+            retryResult, for: volume, allowsErrorAlerts: allowsErrorAlerts,
+            isUserInitiated: isUserInitiated)
         }
       } else {
-        self.handleMountResult(result, for: volume, allowsErrorAlerts: allowsErrorAlerts)
+        self.handleMountResult(
+          result, for: volume, allowsErrorAlerts: allowsErrorAlerts,
+          isUserInitiated: isUserInitiated)
       }
     }
   }
 
   private func handleMountResult(
-    _ result: ProcessResult, for volume: Volume, allowsErrorAlerts: Bool = true
+    _ result: ProcessResult, for volume: Volume, allowsErrorAlerts: Bool = true,
+    isUserInitiated: Bool = true
   ) {
     DispatchQueue.main.async {
       if !result.succeeded {
@@ -328,7 +330,9 @@ class DriveManager: ObservableObject {
         // handleDiskUtilError honors allowsErrorAlerts: silent mount paths
         // still get keychain-based unlocking of encrypted volumes, but never
         // surface dialogs.
-        self.handleDiskUtilError(errMsg, for: volume.name, volume: volume, operation: .mount, allowsErrorAlerts: allowsErrorAlerts)
+        self.handleDiskUtilError(
+          errMsg, for: volume.name, volume: volume, operation: .mount,
+          allowsErrorAlerts: allowsErrorAlerts, isUserInitiated: isUserInitiated)
         self.busyVolumeIdentifier = nil
       }
       self.refreshDrives(qos: .userInitiated)
@@ -337,13 +341,23 @@ class DriveManager: ObservableObject {
 
   func mountLockedVolume(_ volume: Volume, passphrase: String) {
     KeepAliveManager.shared.resume(volume: volume)
-    let userInfo = ["deviceIdentifier": volume.id]
-    NotificationCenter.default.post(name: .willManuallyMount, object: nil, userInfo: userInfo)
     DispatchQueue.main.async { self.busyVolumeIdentifier = volume.id }
 
     DispatchQueue.global(qos: .userInitiated).async {
       self.performUnlock(volume: volume, passphrase: passphrase)
     }
+  }
+
+  /// Grants DiskArbitration mount approval for a MountMate-initiated
+  /// operation on the given identifier. The approval is short-lived and
+  /// consumed by the first mount request, so it must be (re-)granted
+  /// immediately before each `diskutil` mount/unlock attempt: an earlier
+  /// grant is typically already consumed or expired — e.g. after the user
+  /// answered a keychain or password prompt — and the blocked-volume /
+  /// block-USB dissenters would otherwise veto the mount.
+  private func grantManualMountApproval(for identifier: String) {
+    NotificationCenter.default.post(
+      name: .willManuallyMount, object: nil, userInfo: ["deviceIdentifier": identifier])
   }
 
   /// Where a saved encrypted-volume password was found.
@@ -371,12 +385,14 @@ class DriveManager: ObservableObject {
   /// in the keychain (see `savedPassphrase(for:)`) so the user is not asked
   /// again. The password prompt only appears when no saved password exists —
   /// or a saved one fails; automatic (non-user-initiated) mounts stay silent.
-  private func recoverLockedVolume(_ volume: Volume, allowsErrorAlerts: Bool) {
+  private func recoverLockedVolume(
+    _ volume: Volume, allowsErrorAlerts: Bool, isUserInitiated: Bool
+  ) {
     DispatchQueue.global(qos: .userInitiated).async {
       if let saved = Self.savedPassphrase(for: volume) {
         self.performUnlock(
           volume: volume, passphrase: saved.passphrase, savedSource: saved.source,
-          allowsErrorAlerts: allowsErrorAlerts)
+          allowsErrorAlerts: allowsErrorAlerts, isUserInitiated: isUserInitiated)
       } else if allowsErrorAlerts {
         DispatchQueue.main.async { self.presentLockedVolumeAlert(for: volume) }
       }
@@ -409,14 +425,25 @@ class DriveManager: ObservableObject {
 
   private func performUnlock(
     volume: Volume, passphrase: String, savedSource: SavedPassphraseSource? = nil,
-    allowsErrorAlerts: Bool = true
+    allowsErrorAlerts: Bool = true, isUserInitiated: Bool = true
   ) {
+    if isUserInitiated {
+      grantManualMountApproval(for: volume.id)
+    }
     let result = runProcess(
       executable: "/usr/sbin/diskutil",
       arguments: ["apfs", "unlockVolume", volume.id, "-stdinpassphrase"],
       input: Data(passphrase.utf8))
     DispatchQueue.main.async {
       if !result.succeeded {
+        if Self.isVolumeNotLockedErrorMessage(result.stderr) {
+          // The volume is already unlocked — e.g. an earlier attempt unlocked
+          // it but its mount was vetoed, or macOS's attach-time auto-unlock
+          // raced us. Mounting it is all that is left.
+          self.mountUnlockedVolume(
+            volume, allowsErrorAlerts: allowsErrorAlerts, isUserInitiated: isUserInitiated)
+          return
+        }
         if let source = savedSource {
           // A saved password no longer works. Drop MountMate's own stale
           // entry (the system entry is left for macOS's unlock dialog to
@@ -433,11 +460,30 @@ class DriveManager: ObservableObject {
             ? "The operation timed out after 15 seconds."
             : (result.stderr.isEmpty
               ? "diskutil exited with code \(result.exitCode ?? -1)." : result.stderr)
-          self.handleDiskUtilError(errMsg, for: volume.name, volume: volume, operation: .mount)
+          self.handleDiskUtilError(
+            errMsg, for: volume.name, volume: volume, operation: .mount)
         }
         self.busyVolumeIdentifier = nil
       }
       self.refreshDrives(qos: .userInitiated)
+    }
+  }
+
+  /// Mounts a volume that is known to be unlocked (following a "not locked"
+  /// unlock failure) — with a fresh mount approval so a MountMate-initiated
+  /// attempt cannot be vetoed by its own auto-mount blockers.
+  private func mountUnlockedVolume(
+    _ volume: Volume, allowsErrorAlerts: Bool, isUserInitiated: Bool
+  ) {
+    if isUserInitiated {
+      grantManualMountApproval(for: volume.deviceIdentifier)
+    }
+    DispatchQueue.global(qos: .userInitiated).async {
+      let result = runProcess(
+        executable: "/usr/sbin/diskutil", arguments: ["mount", volume.deviceIdentifier])
+      self.handleMountResult(
+        result, for: volume, allowsErrorAlerts: allowsErrorAlerts,
+        isUserInitiated: isUserInitiated)
     }
   }
 
@@ -876,7 +922,7 @@ class DriveManager: ObservableObject {
 
   private func handleDiskUtilError(
     _ error: String, for name: String, volume: Volume? = nil, disk: PhysicalDisk? = nil,
-    operation: DiskOperation, allowsErrorAlerts: Bool = true
+    operation: DiskOperation, allowsErrorAlerts: Bool = true, isUserInitiated: Bool = true
   ) {
     let parsedError = self.parseDiskUtilError(error, for: name, operation: operation)
     let title: String
@@ -890,7 +936,8 @@ class DriveManager: ObservableObject {
         // Password" entry first, then MountMate's legacy entry) before — or,
         // for automatic mounts, instead of — asking the user. The prompt only
         // appears if no saved password unlocks the volume.
-        recoverLockedVolume(volume, allowsErrorAlerts: allowsErrorAlerts)
+        recoverLockedVolume(
+          volume, allowsErrorAlerts: allowsErrorAlerts, isUserInitiated: isUserInitiated)
         return
       }
       // Without a volume model there is nothing to unlock programmatically.
@@ -1032,6 +1079,12 @@ class DriveManager: ObservableObject {
   static func isLockedVolumeErrorMessage(_ rawError: String) -> Bool {
     rawError.contains(
       "This is an encrypted and locked APFS Volume; use \"diskutil apfs unlockVolume\"")
+  }
+
+  /// diskutil's wording when `unlockVolume` is pointed at a volume that is
+  /// already unlocked.
+  static func isVolumeNotLockedErrorMessage(_ rawError: String) -> Bool {
+    rawError.contains("The given APFS Volume is not locked")
   }
 
   private func getFileSystemAttributes(for path: String) throws -> (free: Int64, total: Int64) {

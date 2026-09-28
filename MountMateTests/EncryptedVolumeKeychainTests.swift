@@ -78,6 +78,16 @@ final class EncryptedVolumeKeychainTests: XCTestCase {
       DriveManager.isLockedVolumeErrorMessage("Volume on disk9s2 failed to mount"))
     XCTAssertFalse(DriveManager.isLockedVolumeErrorMessage(""))
   }
+
+  func testNotLockedVolumeErrorDetection() {
+    // diskutil's wording when unlocking a volume that is already unlocked.
+    XCTAssertTrue(
+      DriveManager.isVolumeNotLockedErrorMessage(
+        "Error unlocking APFS Volume: The given APFS Volume is not locked (-69589)"))
+    XCTAssertFalse(
+      DriveManager.isVolumeNotLockedErrorMessage(
+        "Error unlocking APFS Volume: The pass phrase does not match"))
+  }
 }
 
 extension DriveManager.SavedPassphraseSource: Equatable {}
