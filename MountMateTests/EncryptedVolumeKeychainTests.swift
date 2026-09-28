@@ -1,7 +1,6 @@
 //  Created by homielab.com
 
 import XCTest
-
 @testable import MountMate
 
 final class EncryptedVolumeKeychainTests: XCTestCase {
@@ -23,36 +22,70 @@ final class EncryptedVolumeKeychainTests: XCTestCase {
       category: .user, isProtected: false, snapshots: [], storageError: nil)
   }
 
-  func testEncryptedVolumePasswordRoundTrip() {
-    XCTAssertNil(keychain.loadEncryptedVolumePassword(volumeUUID: volumeUUID))
+  /// Creates a system-format "Encrypted Volume Password" item directly, the
+  /// way macOS's own unlock dialog would.
+  private func createSystemEntry(password: String) -> OSStatus {
+    var attributes: [String: Any] = [
+      kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: volumeUUID,
+      kSecAttrAccount as String: volumeUUID,
+      kSecValueData as String: password.data(using: .utf8)!,
+    ]
+    attributes[kSecAttrLabel as String] = "Test Volume"
+    attributes[kSecAttrDescription as String] = "Encrypted Volume Password"
+    return SecItemAdd(attributes as CFDictionary, nil)
+  }
 
-    let status = keychain.saveEncryptedVolumePassword(
-      "secret", volumeUUID: volumeUUID, volumeName: "Test Volume")
-    XCTAssertEqual(status, errSecSuccess)
+  private func systemEntryCount() -> Int {
+    let query: [String: Any] = [
+      kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: volumeUUID,
+      kSecAttrAccount as String: volumeUUID,
+      kSecMatchLimit as String: kSecMatchLimitAll,
+      kSecReturnAttributes as String: true,
+    ]
+    var result: AnyObject?
+    let status = SecItemCopyMatching(query as CFDictionary, &result)
+    guard status == errSecSuccess else { return 0 }
+    return (result as? [[String: Any]])?.count ?? 0
+  }
+
+  func testRememberedPasswordSavesPrivateEntryWhenNoSystemEntryExists() {
+    let outcome = keychain.saveRememberedEncryptedVolumePassword(
+      "secret", volumeUUID: volumeUUID)
+    XCTAssertEqual(outcome, .privateEntrySaved)
+    XCTAssertNil(keychain.loadEncryptedVolumePassword(volumeUUID: volumeUUID))
+    XCTAssertEqual(keychain.load(account: volumeUUID), "secret")
+  }
+
+  func testRememberedPasswordUpdatesExistingSystemEntryInPlace() {
+    XCTAssertEqual(createSystemEntry(password: "old"), errSecSuccess)
+
+    let outcome = keychain.saveRememberedEncryptedVolumePassword(
+      "new", volumeUUID: volumeUUID)
+    XCTAssertEqual(outcome, .systemEntryUpdated)
+    XCTAssertEqual(keychain.loadEncryptedVolumePassword(volumeUUID: volumeUUID), "new")
+    // In place: still exactly one system item, and no private duplicate.
+    XCTAssertEqual(systemEntryCount(), 1)
+    XCTAssertNil(keychain.load(account: volumeUUID))
+  }
+
+  func testRememberedPasswordReplacesStalePrivateEntry() {
+    _ = keychain.save(password: "old private", for: volumeUUID)
+    XCTAssertEqual(createSystemEntry(password: "system"), errSecSuccess)
+
+    _ = keychain.saveRememberedEncryptedVolumePassword("new", volumeUUID: volumeUUID)
+    XCTAssertEqual(keychain.loadEncryptedVolumePassword(volumeUUID: volumeUUID), "new")
+    XCTAssertNil(keychain.load(account: volumeUUID))
+    XCTAssertEqual(systemEntryCount(), 1)
+  }
+
+  func testEncryptedVolumePasswordLoadDeleteRoundTrip() {
+    XCTAssertEqual(createSystemEntry(password: "secret"), errSecSuccess)
     XCTAssertEqual(keychain.loadEncryptedVolumePassword(volumeUUID: volumeUUID), "secret")
 
     keychain.deleteEncryptedVolumePassword(volumeUUID: volumeUUID)
     XCTAssertNil(keychain.loadEncryptedVolumePassword(volumeUUID: volumeUUID))
-  }
-
-  func testSaveEncryptedVolumePasswordOverwritesPreviousValue() {
-    keychain.saveEncryptedVolumePassword("old", volumeUUID: volumeUUID, volumeName: "Test")
-    keychain.saveEncryptedVolumePassword("new", volumeUUID: volumeUUID, volumeName: "Test")
-    XCTAssertEqual(keychain.loadEncryptedVolumePassword(volumeUUID: volumeUUID), "new")
-  }
-
-  func testSystemEntryIsIndependentFromLegacyMountMateEntry() {
-    // The system-format entry is keyed by the volume UUID itself, while the
-    // legacy MountMate entry lives under the app's service name. They must
-    // not shadow each other.
-    keychain.saveEncryptedVolumePassword("system pw", volumeUUID: volumeUUID, volumeName: "T")
-    _ = keychain.save(password: "legacy pw", for: volumeUUID)
-
-    XCTAssertEqual(keychain.loadEncryptedVolumePassword(volumeUUID: volumeUUID), "system pw")
-    XCTAssertEqual(keychain.load(account: volumeUUID), "legacy pw")
-
-    keychain.deleteEncryptedVolumePassword(volumeUUID: volumeUUID)
-    XCTAssertEqual(keychain.load(account: volumeUUID), "legacy pw")
   }
 
   func testSavedPassphrasePrefersSystemEntryOverLegacyEntry() {
@@ -63,7 +96,7 @@ final class EncryptedVolumeKeychainTests: XCTestCase {
     XCTAssertEqual(DriveManager.savedPassphrase(for: volume)?.passphrase, "legacy pw")
     XCTAssertEqual(DriveManager.savedPassphrase(for: volume)?.source, .mountMate)
 
-    keychain.saveEncryptedVolumePassword("system pw", volumeUUID: volumeUUID, volumeName: "T")
+    XCTAssertEqual(createSystemEntry(password: "system pw"), errSecSuccess)
     XCTAssertEqual(DriveManager.savedPassphrase(for: volume)?.passphrase, "system pw")
     XCTAssertEqual(DriveManager.savedPassphrase(for: volume)?.source, .system)
   }
@@ -90,4 +123,5 @@ final class EncryptedVolumeKeychainTests: XCTestCase {
   }
 }
 
+extension KeychainManager.RememberedPasswordSave: Equatable {}
 extension DriveManager.SavedPassphraseSource: Equatable {}

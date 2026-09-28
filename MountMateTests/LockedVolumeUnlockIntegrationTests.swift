@@ -49,11 +49,18 @@ final class LockedVolumeUnlockIntegrationTests: XCTestCase {
     let before = try Self.volumeInfo(volumeUUID)
     XCTAssertFalse(Self.isVolumeMounted(before))
 
-    // Simulate "remember password": the system-format entry the OS's own
-    // unlock dialog would create.
-    let status = KeychainManager.shared.saveEncryptedVolumePassword(
-      passphrase, volumeUUID: volumeUUID, volumeName: (before["VolumeName"] as? String) ?? "")
-    XCTAssertEqual(status, errSecSuccess)
+    // Simulate "remember password": a system-format entry created the way
+    // macOS's own unlock dialog would create it (MountMate's save path only
+    // updates such entries in place, so create it directly here).
+    var attributes: [String: Any] = [
+      kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: volumeUUID,
+      kSecAttrAccount as String: volumeUUID,
+      kSecValueData as String: passphrase.data(using: .utf8)!,
+      kSecAttrLabel as String: (before["VolumeName"] as? String) ?? "",
+    ]
+    attributes[kSecAttrDescription as String] = "Encrypted Volume Password"
+    XCTAssertEqual(SecItemAdd(attributes as CFDictionary, nil), errSecSuccess)
 
     let volume = Volume(
       id: volumeUUID, deviceIdentifier: before["DeviceIdentifier"] as! String,
