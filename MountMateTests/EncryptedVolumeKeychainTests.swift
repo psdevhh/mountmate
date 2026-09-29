@@ -94,10 +94,25 @@ final class EncryptedVolumeKeychainTests: XCTestCase {
   }
 
   func testAlreadyUnmountedDetection() {
-    XCTAssertTrue(
-      DriveManager.isAlreadyUnmountedMessage("disk7s1 was already unmounted"))
-    XCTAssertTrue(DriveManager.isAlreadyUnmountedMessage("volume is not mounted"))
-    XCTAssertFalse(DriveManager.isAlreadyUnmountedMessage("resource busy"))
+    func result(_ output: String, stderr: String = "") -> ProcessResult {
+      ProcessResult(stdout: output, stderr: stderr, exitCode: 1, timedOut: false)
+    }
+    XCTAssertTrue(result("disk7s1 was already unmounted").isAlreadyUnmounted)
+    XCTAssertTrue(result("volume is not mounted").isAlreadyUnmounted)
+    XCTAssertTrue(result("", stderr: "disk7s1 was already unmounted").isAlreadyUnmounted)
+    XCTAssertFalse(result("resource busy").isAlreadyUnmounted)
+  }
+
+  func testProcessResultErrorMessageWording() {
+    XCTAssertEqual(
+      ProcessResult(stdout: "", stderr: "", exitCode: nil, timedOut: true).errorMessage,
+      "The operation timed out after 15 seconds.")
+    XCTAssertEqual(
+      ProcessResult(stdout: "", stderr: "", exitCode: 6, timedOut: false).errorMessage,
+      "diskutil exited with code 6.")
+    XCTAssertEqual(
+      ProcessResult(stdout: "", stderr: "boom", exitCode: 1, timedOut: false).errorMessage,
+      "boom")
   }
 
   func testHasAnyRememberedPasswordsReflectsSavedEntries() {
@@ -105,5 +120,3 @@ final class EncryptedVolumeKeychainTests: XCTestCase {
     XCTAssertTrue(keychain.hasAnyRememberedPasswords())
   }
 }
-
-extension DriveManager.SavedPassphraseSource: Equatable {}

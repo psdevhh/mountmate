@@ -206,13 +206,8 @@ class DriveManager: ObservableObject {
       let result = runProcess(executable: "/usr/sbin/diskutil", arguments: ejectArgs)
       DispatchQueue.main.async {
         if !result.succeeded {
-          let errMsg =
-            result.timedOut
-            ? "The operation timed out after 15 seconds."
-            : (result.stderr.isEmpty
-              ? "diskutil exited with code \(result.exitCode ?? -1)." : result.stderr)
           self.handleDiskUtilError(
-            errMsg, for: disk.name ?? disk.id, disk: disk, operation: .eject)
+            result.errorMessage, for: disk.name ?? disk.id, disk: disk, operation: .eject)
           self.busyEjectingIdentifier = nil
         }
         self.refreshDrives(qos: .userInitiated)
@@ -232,13 +227,8 @@ class DriveManager: ObservableObject {
         : runProcess(executable: "/usr/sbin/diskutil", arguments: ["eject", disk.id])
       DispatchQueue.main.async {
         if !result.succeeded {
-          let errMsg =
-            result.timedOut
-            ? "The operation timed out after 15 seconds."
-            : (result.stderr.isEmpty
-              ? "diskutil exited with code \(result.exitCode ?? -1)." : result.stderr)
           self.handleDiskUtilError(
-            errMsg, for: disk.name ?? disk.id, disk: disk, operation: .eject)
+            result.errorMessage, for: disk.name ?? disk.id, disk: disk, operation: .eject)
           self.busyEjectingIdentifier = nil
         }
         self.refreshDrives(qos: .userInitiated)
@@ -254,13 +244,8 @@ class DriveManager: ObservableObject {
         executable: "/usr/sbin/diskutil", arguments: ["unmount", "force", volume.deviceIdentifier])
       DispatchQueue.main.async {
         if !result.succeeded {
-          let errMsg =
-            result.timedOut
-            ? "The operation timed out after 15 seconds."
-            : (result.stderr.isEmpty
-              ? "diskutil exited with code \(result.exitCode ?? -1)." : result.stderr)
           self.handleDiskUtilError(
-            errMsg, for: volume.name, volume: volume, operation: .unmount)
+            result.errorMessage, for: volume.name, volume: volume, operation: .unmount)
           self.busyVolumeIdentifier = nil
         }
         self.refreshDrives(qos: .userInitiated)
@@ -322,16 +307,11 @@ class DriveManager: ObservableObject {
   ) {
     DispatchQueue.main.async {
       if !result.succeeded {
-        let errMsg =
-          result.timedOut
-          ? "The operation timed out after 15 seconds."
-          : (result.stderr.isEmpty
-            ? "diskutil exited with code \(result.exitCode ?? -1)." : result.stderr)
         // handleDiskUtilError honors allowsErrorAlerts: silent mount paths
         // still get keychain-based unlocking of encrypted volumes, but never
         // surface dialogs.
         self.handleDiskUtilError(
-          errMsg, for: volume.name, volume: volume, operation: .mount,
+          result.errorMessage, for: volume.name, volume: volume, operation: .mount,
           allowsErrorAlerts: allowsErrorAlerts, isUserInitiated: isUserInitiated)
         self.busyVolumeIdentifier = nil
       }
@@ -377,7 +357,9 @@ class DriveManager: ObservableObject {
   /// only consulted as a fallback; after a successful use its password is
   /// imported into MountMate's private entry (see `performUnlock`), so the
   /// system entry is read at most once per password.
-  static func savedPassphrase(for volume: Volume) -> (passphrase: String, source: SavedPassphraseSource)? {
+  static func savedPassphrase(for volume: Volume) -> (
+    passphrase: String, source: SavedPassphraseSource
+  )? {
     if let password = KeychainManager.shared.load(account: volume.id) {
       return (password, .mountMate)
     }
@@ -476,13 +458,9 @@ class DriveManager: ObservableObject {
             self.presentLockedVolumeAlert(for: volume)
           }
         } else if allowsErrorAlerts {
-          let errMsg =
-            result.timedOut
-            ? "The operation timed out after 15 seconds."
-            : (result.stderr.isEmpty
-              ? "diskutil exited with code \(result.exitCode ?? -1)." : result.stderr)
           self.handleDiskUtilError(
-            errMsg, for: volume.name, volume: volume, operation: .mount)
+            result.errorMessage, for: volume.name, volume: volume, operation: .mount,
+            allowsErrorAlerts: allowsErrorAlerts, isUserInitiated: isUserInitiated)
         }
         self.busyVolumeIdentifier = nil
       }
@@ -518,26 +496,14 @@ class DriveManager: ObservableObject {
       DispatchQueue.main.async {
         // A concurrent unmount (e.g. the OS reacting to the volume going
         // away) can win the race; the end state is what the user asked for.
-        let benign = Self.isAlreadyUnmountedMessage("\(result.stdout)\(result.stderr)")
-        if !result.succeeded, !benign {
-          let errMsg =
-            result.timedOut
-            ? "The operation timed out after 15 seconds."
-            : (result.stderr.isEmpty
-              ? "diskutil exited with code \(result.exitCode ?? -1)." : result.stderr)
+        if !result.succeeded, !result.isAlreadyUnmounted {
           self.handleDiskUtilError(
-            errMsg, for: volume.name, volume: volume, operation: .unmount)
+            result.errorMessage, for: volume.name, volume: volume, operation: .unmount)
           self.busyVolumeIdentifier = nil
         }
         self.refreshDrives(qos: .userInitiated)
       }
     }
-  }
-
-  /// diskutil's wording when there was nothing left to unmount.
-  static func isAlreadyUnmountedMessage(_ output: String) -> Bool {
-    let lower = output.lowercased()
-    return lower.contains("already unmounted") || lower.contains("not mounted")
   }
 
   func remount(volume: Volume) {

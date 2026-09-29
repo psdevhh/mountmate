@@ -235,15 +235,22 @@ class DiskMounter: ObservableObject {
       this.scheduleLockedVolumeSweep()
     }
 
+    var iterator = io_iterator_t(0)
     let matching = IOServiceMatching("IOMedia")
-    let addResult = IOServiceAddMatchingNotification(
-      port, kIOFirstPublishNotification, matching, callback, refcon, &ioMediaIterator)
+    guard
+      IOServiceAddMatchingNotification(
+        port, kIOFirstPublishNotification, matching, callback, refcon, &iterator)
+        == KERN_SUCCESS
+    else {
+      stopMediaNotifications()
+      return
+    }
+    ioMediaIterator = iterator
 
     // The iterator arrives pre-armed with all already-present media; drain
     // it so only future arrivals notify, then sweep once for the current
     // state (covers a drive plugged in before the app launched).
-    var initialCount = 0
-    while IOIteratorNext(ioMediaIterator) != 0 { initialCount += 1 }
+    while IOIteratorNext(ioMediaIterator) != 0 {}
     scheduleLockedVolumeSweep()
   }
 
@@ -252,6 +259,10 @@ class DiskMounter: ObservableObject {
     IONotificationPortSetDispatchQueue(port, nil)
     IONotificationPortDestroy(port)
     ioNotificationPort = nil
+    if ioMediaIterator != 0 {
+      IOObjectRelease(ioMediaIterator)
+      ioMediaIterator = 0
+    }
   }
 
   /// Coalesces bursts of media arrivals (a disk publishes several IOMedia
@@ -384,7 +395,7 @@ class DiskMounter: ObservableObject {
             print("🚫 Unmounted blocked volume “\(info.name)” after startup.")
             break
           }
-          if Self.isAlreadyUnmounted(result) {
+          if result.isAlreadyUnmounted {
             print("ℹ️ Blocked volume “\(info.name)” was already unmounted.")
             break
           }
@@ -397,11 +408,6 @@ class DiskMounter: ObservableObject {
         }
       }
     }
-  }
-
-  private static func isAlreadyUnmounted(_ result: ProcessResult) -> Bool {
-    let output = "\(result.stdout)\n\(result.stderr)".lowercased()
-    return output.contains("already unmounted") || output.contains("not mounted")
   }
 
   private func stopDiskArbitration() {

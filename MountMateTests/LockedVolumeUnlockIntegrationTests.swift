@@ -114,8 +114,16 @@ final class LockedVolumeUnlockIntegrationTests: XCTestCase {
     process.standardOutput = pipe
     process.standardError = Pipe()
     try process.run()
+    // Drain concurrently so a full pipe buffer cannot block the child.
+    var data = Data()
+    let drained = DispatchGroup()
+    drained.enter()
+    DispatchQueue.global().async {
+      data = pipe.fileHandleForReading.readDataToEndOfFile()
+      drained.leave()
+    }
     process.waitUntilExit()
-    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    drained.wait()
     return try XCTUnwrap(
       PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any],
       "diskutil info returned no plist for \(uuid)")

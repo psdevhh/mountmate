@@ -31,9 +31,18 @@ final class AutoUnlockOnAppearTests: XCTestCase {
     process.standardOutput = pipe
     process.standardError = pipe
     try? process.run()
+    // Drain concurrently: reading only after exit deadlocks once output
+    // fills the pipe buffer (e.g. `diskutil list -plist` on busy systems).
+    var out = Data()
+    let drained = DispatchGroup()
+    drained.enter()
+    DispatchQueue.global().async {
+      out = pipe.fileHandleForReading.readDataToEndOfFile()
+      drained.leave()
+    }
     process.waitUntilExit()
-    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-    return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+    drained.wait()
+    return (process.terminationStatus, String(data: out, encoding: .utf8) ?? "")
   }
 
   /// `diskutil list -plist` as a dictionary.

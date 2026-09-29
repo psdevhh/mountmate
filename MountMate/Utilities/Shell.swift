@@ -17,6 +17,23 @@ struct ProcessResult {
 
   /// Convenience: exited with code 0 and did not time out.
   var succeeded: Bool { !timedOut && exitCode == 0 }
+
+  /// Error text for a failed run: a worded timeout (matching `runProcess`'s
+  /// default 15-second timeout), the child's stderr, or — when stderr is
+  /// empty — a bare exit-code line.
+  var errorMessage: String {
+    if timedOut { return "The operation timed out after 15 seconds." }
+    if stderr.isEmpty { return "diskutil exited with code \(exitCode ?? -1)." }
+    return stderr
+  }
+
+  /// diskutil's wording when there was nothing left to unmount — the benign
+  /// outcome of a lost race against a concurrent unmount (e.g. the OS
+  /// reacting to the volume going away).
+  var isAlreadyUnmounted: Bool {
+    let output = "\(stdout)\n\(stderr)".lowercased()
+    return output.contains("already unmounted") || output.contains("not mounted")
+  }
 }
 
 // MARK: - Direct Process Runner
